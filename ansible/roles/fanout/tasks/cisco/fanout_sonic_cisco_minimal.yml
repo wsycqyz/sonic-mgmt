@@ -140,3 +140,13 @@
       systemd:
         name: cisco_fanout_traps_clear
         state: restarted
+
+    - name: Wait for cisco_fanout_traps_clear.service to clear the traps
+      # The service retries for up to 30 minutes (TRAPS_CLEAR_TIMEOUT), then fails.
+      shell: systemctl show cisco_fanout_traps_clear -p SubState --value
+      register: traps_clear_state
+      until: traps_clear_state.stdout in ['exited', 'failed']
+      retries: 140
+      delay: 15
+      changed_when: false
+      failed_when: traps_clear_state.stdout != 'exited'
