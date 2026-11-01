@@ -23,10 +23,18 @@ COPP_GRACE = int(os.environ.get('TRAPS_CLEAR_COPP_GRACE', '600'))
 COPP_CFG = '/etc/sonic/copp_cfg.json'
 MARKER_OK = '--- TRAP CLEAR COMPLETE ---'
 RESULT_TAGS = ('TRAPCLR ', '--- TRAP CLEAR', 'FATAL SDK ERROR')
+# dshell_client prints "... debug shell server for asic 0 is not running!" until syncd has started it.
+DSHELL_NOT_UP = 'debug shell server for asic'
+DSHELL_WAIT = 'waiting for the SDK debug shell server in syncd'
 
 deadline = time.time() + TIMEOUT
 
-# Default traps to clear. SDK < 1.66 names the events LA_EVENT_<name>, SDK >= 1.66 la_event_e_<name>.
+# Default traps to clear, named without the SDK prefix.
+# SDK version compatibility (checked on fanouts):
+# - SDK < 1.66 uses uppercase constants, e.g. LA_EVENT_ETHERNET_LACP (SONiC 202205, SDK 1.60).
+# - SDK >= 1.66 uses lowercase constants, e.g. la_event_e_ETHERNET_LACP (SONiC 202405 to 202511,
+#   SDK 24.7 to 25.11).
+# The payload tries the new name first and falls back to the old one, so this list works with both.
 TRAP_EVENTS = [
     "ETHERNET_L2CP0", "ETHERNET_LACP", "ETHERNET_ARP", "ETHERNET_L2CP2",
     "ETHERNET_DHCPV4_SERVER", "ETHERNET_DHCPV4_CLIENT", "ETHERNET_DHCPV6_SERVER", "ETHERNET_DHCPV6_CLIENT",
@@ -205,25 +213,25 @@ def dshell(clear):
 
 
 def clear_and_verify(swss):
+    """Clear the traps and verify them. Return None on success, else the message to log."""
     ok, summary = dshell(clear=True)
     if not ok:
-        log('Attempt failed: ' + summary)
-        return False
+        if DSHELL_NOT_UP in summary and 'not running' in summary:
+            # syncd starts the SDK debug shell server a few minutes after it has created the switch.
+            return DSHELL_WAIT
+        return 'Attempt failed: ' + summary
     log(summary)
     # Read the traps again after a while, in case something re-armed one after the clear.
     # Success needs the full interval, so do not let the deadline shorten it.
     if remaining() < SETTLE:
-        log(f'Not enough time left to re-check the traps {SETTLE}s after the clear')
-        return False
+        return f'Not enough time left to re-check the traps {SETTLE}s after the clear'
     pause(SETTLE)
     if swss_started() != swss:
-        log('swss restarted after the clear; waiting for its orchagent again')
-        return False
+        return 'swss restarted after the clear; waiting for its orchagent again'
     ok, summary = dshell(clear=False)
     if not ok:
-        log(f'Traps not clear {SETTLE}s later, clearing again: ' + summary)
-        return False
-    return True
+        return f'Traps not clear {SETTLE}s later, clearing again: ' + summary
+    return None
 
 
 def main():
@@ -231,7 +239,7 @@ def main():
     deadline = time.time() + TIMEOUT
     log('Starting Cisco fanout trap clear: waiting for syncd, dshell_client and orchagent...')
     copp_since = None
-    last_msg = None
+    last_wait = last_attempt = None
     while True:
         ready, msg, swss = False, 'syncd container is not running yet', ''
         if syncd_running():
@@ -245,12 +253,19 @@ def main():
             # hostif traps can still be in ASIC_DB until swss restarts and flushes it.
             copp_since = copp_since or time.time()
             ready, msg = copp_ready(copp_since)
-        if msg != last_msg:
+        if msg != last_wait:
             log(msg)
-            last_msg = msg
-        if ready and clear_and_verify(swss):
-            log(f'Success: Traps cleared and still cleared {SETTLE}s later.')
-            return 0
+            last_wait = msg
+            last_attempt = None
+        if ready:
+            result = clear_and_verify(swss)
+            if result is None:
+                log(f'Success: Traps cleared and still cleared {SETTLE}s later.')
+                return 0
+            # Until syncd's SDK debug shell server is up, every attempt fails the same way: log that once.
+            if not (result == DSHELL_WAIT and last_attempt == DSHELL_WAIT):
+                log(result)
+            last_attempt = result
         if remaining() <= 0:
             log(f'Timeout: Failed to clear traps after {TIMEOUT}s.')
             return 1
