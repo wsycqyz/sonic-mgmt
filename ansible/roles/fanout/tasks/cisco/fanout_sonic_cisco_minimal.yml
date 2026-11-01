@@ -96,6 +96,9 @@
   # run and is not needed. Extend the substring list when new
   # non-Silicon-One Cisco fanout hwsku families appear.
   when: "'Cisco-C8220TG' not in local_hwsku"
+  # Like the other tasks here: without it, a run without -b reloads the fanout and then fails here,
+  # leaving the default traps armed.
+  become: yes
   block:
     - name: Copy cisco_fanout_traps_clear.py to the device
       copy:
